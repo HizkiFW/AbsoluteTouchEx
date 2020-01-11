@@ -38,6 +38,20 @@
 #define HOTKEY_CALIBRATION_MOD (MOD_SHIFT)
 #define HOTKEY_CALIBRATION_VK VK_F7
 
+// Hotkey for saving calibration
+#define HOTKEY_SAVE_ID 0xCAFD
+#define HOTKEY_SAVE_MOD (MOD_SHIFT)
+#define HOTKEY_SAVE_VK VK_F8
+
+// Default calibration file
+#define CALIBRATION_FILE "atx-calibration.conf"
+
+// Allowed options for the calibration config file
+#define CALIBRATION_OPTION_LEFT "LEFT"
+#define CALIBRATION_OPTION_TOP "TOP"
+#define CALIBRATION_OPTION_RIGHT "RIGHT"
+#define CALIBRATION_OPTION_BOTTOM "BOTTOM"
+
 // C++ exception wrapping the Win32 GetLastError() status
 class win32_error : std::exception
 {
@@ -138,6 +152,12 @@ static bool g_enabled;
 
 // Whether currently in calibration mode
 static bool g_inCalibrationMode;
+
+// Whether to autosave calibration when calibrating
+static bool g_saveCalibration;
+
+// Whether the calibration file has been loaded
+static bool g_calibrationLoaded;
 
 // File to write debug output to
 static FILE *g_debugFile;
@@ -645,6 +665,79 @@ AT_GetTouchArea(at_device_info &dev, at_contact &contact)
     }
 }
 
+// Opens the default calibration file if available and tries to parse
+// the calibration info.
+// If the file does not exist, it will do nothing.
+static void
+AT_LoadCalibration(HANDLE hDevice)
+{
+#pragma warning(push)
+#pragma warning(disable:4996)
+    debugf("Trying to open configuration file");
+    FILE *configFile = fopen(CALIBRATION_FILE, "r");
+    if (configFile == nullptr) {
+        debugf("Failed to open config file");
+        return;
+    }
+
+    if (!t_calibrationArea.count(hDevice)) {
+        RECT &touchArea = t_calibrationArea[hDevice];
+        touchArea.left = LONG_MAX;
+        touchArea.top = LONG_MAX;
+        touchArea.right = LONG_MIN;
+        touchArea.bottom = LONG_MIN;
+    }
+    
+    RECT &touchArea = t_calibrationArea.at(hDevice);
+
+    while (1) {
+        char configKey[80];
+        LONG configValue;
+        if (fscanf(configFile, "%s%ld", configKey, &configValue) == EOF) {
+            break;
+        }
+
+        debugf("Calibration file: %s -> %ld", configKey, configValue);
+
+        if (configKey == CALIBRATION_OPTION_LEFT) {
+            touchArea.left = configValue;
+        } else if (configKey == CALIBRATION_OPTION_TOP) {
+            touchArea.top = configValue;
+        } else if (configKey == CALIBRATION_OPTION_RIGHT) {
+            touchArea.right = configValue;
+        } else if (configKey == CALIBRATION_OPTION_BOTTOM) {
+            touchArea.bottom = configValue;
+        }
+    }
+
+    fclose(configFile);
+#pragma warning(pop)
+}
+
+// Opens the default calibration file and saves the current calibration.
+static void
+AT_SaveCalibration(HANDLE hDevice)
+{
+#pragma warning(push)
+#pragma warning(disable:4996)
+    debugf("Opening calibration file for writing");
+    FILE *configFile = fopen(CALIBRATION_FILE, "w");
+    if (configFile == nullptr) {
+        debugf("Failed to open config file for writing");
+        return;
+    }
+
+    RECT &touchArea = t_calibrationArea.at(hDevice);
+    fprintf(configFile, "%s %ld\n", CALIBRATION_OPTION_LEFT, touchArea.left);
+    fprintf(configFile, "%s %ld\n", CALIBRATION_OPTION_TOP, touchArea.top);
+    fprintf(configFile, "%s %ld\n", CALIBRATION_OPTION_RIGHT, touchArea.right);
+    fprintf(configFile, "%s %ld\n", CALIBRATION_OPTION_BOTTOM, touchArea.bottom);
+
+    fclose(configFile);
+    debugf("Calibration file written");
+#pragma warning(pop)
+}
+
 // Handles a WM_INPUT event. May update wParam/lParam to be delivered
 // to the real WndProc. Returns true if the event is handled entirely
 // at the hook layer and should not be delivered to the real WndProc.
@@ -679,10 +772,20 @@ AT_HandleRawInput(WPARAM *wParam, LPARAM *lParam)
         return true;
     }
 
+    // Try to load calibration file
+    if (!g_calibrationLoaded) {
+        AT_LoadCalibration(hdr.hDevice);
+        g_calibrationLoaded = true;
+        return true;
+    }
+
     // If we're in calibration mode, swallow input and extend the
     // touch bounding area.
     if (g_inCalibrationMode) {
         AT_ExtendCalibrationArea(hdr.hDevice, contacts);
+        if (g_saveCalibration) {
+            AT_SaveCalibration(hdr.hDevice);
+        }
         return true;
     }
 
@@ -791,9 +894,13 @@ AT_WndProcHook(
         AT_ToggleCalibrationMode();
         debugf("Calibration mode -> %s", g_inCalibrationMode ? "ON" : "OFF");
         return 0;
+    } else if (message == WM_HOTKEY && wParam == HOTKEY_SAVE_ID) {
+        g_saveCalibration = !g_saveCalibration;
+        debugf("Save calibration -> %s", g_saveCalibration ? "ON" : "OFF");
+        return 0;
     }
 
-    if (g_enabled || g_inCalibrationMode) {
+    if (g_enabled || g_inCalibrationMode || !g_calibrationLoaded) {
         if (message == WM_MOUSEMOVE) {
             debugf("Suppressing WM_MOUSEMOVE message");
             return 0;
@@ -847,6 +954,7 @@ AT_RegisterRawInputDevicesHook(
             debugf("Registering global hotkeys with hWnd=%p", hWnd);
             RegisterHotKey(hWnd, HOTKEY_ENABLE_ID, HOTKEY_ENABLE_MOD, HOTKEY_ENABLE_VK);
             RegisterHotKey(hWnd, HOTKEY_CALIBRATION_ID, HOTKEY_CALIBRATION_MOD, HOTKEY_CALIBRATION_VK);
+            RegisterHotKey(hWnd, HOTKEY_SAVE_ID, HOTKEY_SAVE_MOD, HOTKEY_SAVE_VK);
 
             debugf("Registering touchpad input with hWnd=%p", hWnd);
             try {
